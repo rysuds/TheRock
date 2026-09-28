@@ -88,6 +88,14 @@ def find_libraries(*shortnames: str) -> list[Path]:
 
 _ALL_CDLLS = {}
 
+# Windows error for a file blocked by an App Control policy, which includes
+# Smart App Control.
+_ERROR_SYSTEM_INTEGRITY_POLICY_VIOLATION = 4551
+_APP_CONTROL_TROUBLESHOOTING_URL = (
+    "https://github.com/ROCm/TheRock/blob/main/RELEASES.md"
+    "#windows-rocm-dlls-blocked-by-smart-app-control-winerror-4551"
+)
+
 
 def preload_libraries(*shortnames: str, rtld_global: bool = True):
     """Preloads a list of library names, caching their handles globally.
@@ -111,7 +119,27 @@ def preload_libraries(*shortnames: str, rtld_global: bool = True):
         paths = find_libraries(shortname)
         if not paths:
             continue
-        cdll = ctypes.CDLL(str(paths[0]), mode=mode)
+        try:
+            cdll = ctypes.CDLL(str(paths[0]), mode=mode)
+        except OSError as e:
+            if (
+                platform.system() == "Windows"
+                and getattr(e, "winerror", None)
+                == _ERROR_SYSTEM_INTEGRITY_POLICY_VIOLATION
+            ):
+                raise OSError(
+                    e.errno,
+                    f"An Application Control policy blocked loading the ROCm "
+                    f"library '{shortname}' from '{paths[0]}' (or a DLL that it "
+                    f"depends on). This usually means that Windows Smart App "
+                    f"Control or App Control for Business is enforcing a policy "
+                    f"that does not trust the DLL, for example because it is not "
+                    f"code signed. See {_APP_CONTROL_TROUBLESHOOTING_URL} for how "
+                    f"to find the blocked file and for workarounds.",
+                    None,
+                    e.winerror,
+                ) from e
+            raise
         _ALL_CDLLS[shortname] = cdll
 
 
