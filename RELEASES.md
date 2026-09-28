@@ -139,6 +139,11 @@ dependencies can resolve across products.
 > If you _really_ want a system-wide install, you can pass `--break-system-packages` to `pip` outside a virtual environment.
 > In this case, command-line interface shims for executables are installed to `/usr/local/bin`, which normally has precedence over `/usr/bin` and might therefore conflict with a previous installation of ROCm.
 
+> [!NOTE]
+> On Windows, the DLLs in the ROCm Python packages are not currently code
+> signed, so Smart App Control or App Control for Business can block them. See
+> [Windows: ROCm DLLs blocked by Smart App Control (WinError 4551)](#windows-rocm-dlls-blocked-by-smart-app-control-winerror-4551).
+
 #### Installing multi-arch ROCm Python packages
 
 We provide several Python packages which together form the complete ROCm SDK.
@@ -875,3 +880,42 @@ If your GPU is not recognized or you encounter issues:
   for GTT configuration on unified memory systems)
 - Ensure you have the latest [AMDGPU driver](https://rocm.docs.amd.com/projects/install-on-linux/en/latest/install/quick-start.html#amdgpu-driver-installation)
   on Linux or [Adrenalin driver](https://www.amd.com/en/products/software/adrenalin.html) on Windows
+
+#### Windows: ROCm DLLs blocked by Smart App Control (WinError 4551)
+
+With Windows
+[Smart App Control](https://support.microsoft.com/en-us/windows/security/threat-malware-protection/smart-app-control-frequently-asked-questions)
+or App Control for Business in enforcement mode, `import torch` or
+`rocm_sdk.initialize_process()` can fail with an error like:
+
+```text
+OSError: [WinError 4551] An Application Control policy blocked loading the ROCm library 'hiprand' from '...\_rocm_sdk_libraries\bin\hiprand.dll' (or a DLL that it depends on). ...
+```
+
+Older versions of the `rocm` package report only
+`OSError: [WinError 4551] An Application Control policy has blocked this file`.
+
+These policies block DLLs that they do not trust, and the DLLs in the ROCm
+Python packages are not currently code signed. Only the Windows tarballs at
+https://stable.repo.amd.com/rocm/core/tarball/ are currently signed (see
+[#8538](https://github.com/ROCm/TheRock/issues/8538)).
+
+To see exactly which file was blocked, open Event Viewer and look for event ID
+3077 in the log at
+**Applications and Services Logs > Microsoft > Windows > CodeIntegrity > Operational**.
+The blocked file can be a dependency of the library named in the error, such as
+`rocrand.dll` for `hiprand`.
+
+Options:
+
+- If your workflow can use ROCm from a tarball instead of the Python packages,
+  use one of the signed Windows tarballs (see
+  [Installing multi-arch tarballs](#installing-multi-arch-tarballs)).
+  `rocm_sdk` and PyTorch do not use tarballs: they load the DLLs that are
+  installed with the ROCm Python packages.
+- On devices that use App Control for Business, ask your administrator to allow
+  the ROCm DLLs in your Python environment.
+- Smart App Control does not support exceptions for individual files. Turning
+  it off lets the DLLs load but removes its protection for all apps, and on
+  some Windows versions it cannot be turned back on without resetting Windows.
+  Read Microsoft's Smart App Control FAQ (linked above) before changing it.
