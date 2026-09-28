@@ -21,6 +21,7 @@ Requires Python 3.10+ (``packaging_utils`` type syntax).
 import importlib.util
 import json
 import os
+import re
 import sys
 import tempfile
 import types
@@ -52,6 +53,13 @@ PKG_DEVELOPER_TOOLS = "amdrocm-developer-tools"
 PKG_RUNTIME = "amdrocm-runtime"
 PKG_DEBUGGER = "amdrocm-debugger"
 PKG_CK = "amdrocm-ck"
+PKG_BLAS = "amdrocm-blas"
+PKG_DNN = "amdrocm-dnn"
+PKG_HIPTENSOR = "amdrocm-hiptensor"
+PKG_HPC = "amdrocm-hpc"
+PKG_RAND = "amdrocm-rand"
+PKG_ROCALUTION = "amdrocm-rocalution"
+PKG_SOLVER = "amdrocm-solver"
 
 FFT_HOST_PACKAGE = "amdrocm-fft-host7.1"
 FFT_DEVICE_PACKAGE = "amdrocm-fft7.1-gfx1100"
@@ -98,6 +106,7 @@ from packaging_utils import (  # noqa: E402
     PackageConfig,
     filter_components_fromartifactory,
     get_package_info,
+    has_artifact_for_arch,
     is_gfxarch_package,
     is_key_defined,
     update_package_name,
@@ -341,6 +350,50 @@ def _stage_fft_kpack_tree(artifacts_dir: Path, *, include_host: bool = False) ->
         )
 
 
+def _stage_artifact_dir(artifacts_dir: Path, name: str, manifest_root: str) -> None:
+    """Stage one artifact directory whose manifest lists ``manifest_root``."""
+    root = artifacts_dir / name / manifest_root
+    root.mkdir(parents=True, exist_ok=True)
+    (root / STAGING_PAYLOAD_NAME).write_bytes(STAGING_PAYLOAD_BYTES)
+    (artifacts_dir / name / "artifact_manifest.txt").write_text(
+        f"{manifest_root}/\n", encoding="utf-8"
+    )
+
+
+def _dependency_names(metadata_text: str, field: str) -> list[str]:
+    """Return package names from a ``Depends``/``Requires`` line, without versions.
+
+    RPM specs omit ``Requires`` when there are no dependencies, so a missing field
+    yields an empty list.
+    """
+    prefix = f"{field}:"
+    for line in metadata_text.splitlines():
+        if line.startswith(prefix):
+            return [
+                re.split(r"[\s(]", dep.strip(), maxsplit=1)[0]
+                for dep in line.split(":", 1)[1].split(",")
+                if dep.strip()
+            ]
+    return []
+
+
+def _generated_dependency_names(pkg_name: str, config: PackageConfig) -> list[str]:
+    """Generate real DEB control / RPM spec metadata and return its dependencies."""
+    if config.pkg_type == TEST_PKG_TYPE_RPM:
+        with (
+            patch.object(rpm_package, "package_with_rpmbuild"),
+            patch.object(rpm_package, "move_packages_to_destination", return_value=[]),
+        ):
+            rpm_package.create_versioned_rpm_package(pkg_name, config)
+        return _dependency_names(_read_spec_file(pkg_name, config), "Requires")
+    with (
+        patch.object(deb_package, "package_with_dpkg_build"),
+        patch.object(deb_package, "move_packages_to_destination", return_value=[]),
+    ):
+        deb_package.create_versioned_deb_package(pkg_name, config)
+    return _dependency_names(_read_control_file(pkg_name, config), "Depends")
+
+
 # ---------------------------------------------------------------------------
 # Artifact staging — validates production discovery APIs
 # ---------------------------------------------------------------------------
@@ -475,6 +528,167 @@ class SharedOwnerPackagingTest(BuildPackageTestCase):
         ):
             build_package.build_device_package(PKG_FFT, cfg, "gfx1250")
         external_build.assert_not_called()
+
+
+# ---------------------------------------------------------------------------
+# Target-feature variant artifacts (e.g. ``gfx942:xnack+``) — dependencies
+# ---------------------------------------------------------------------------
+class TargetFeatureVariantDependencyTest(BuildPackageTestCase):
+    """Device payloads staged only as ``{name}_{component}_{target}:<features>``.
+
+    Full-ASAN builds compile gfx942/gfx950 as ``:xnack+`` targets. Components whose
+    device code lives only in fat binaries (no kernel databases), such as rand,
+    solver, hiptensor and rocalution, then have no plain ``_gfx942`` artifact
+    directory (#8558).
+    """
+
+    # Directory suffixes staged per target; "" is the plain artifact directory.
+    LAYOUTS: dict[str, tuple[str, ...]] = {
+        "gfx1100": ("",),
+        "gfx942": (":xnack+",),
+        "gfx950": ("", ":xnack+"),
+        "gfx90a": (":xnack+", ":xnack-"),
+        "gfx1201": (),
+    }
+
+    def _stage_layouts(self) -> PackageConfig:
+        cfg = _kpack_config(
+            self.temp_dir, target=list(self.LAYOUTS), build_variant="asan"
+        )
+        _stage_package_artifacts(PKG_RAND, cfg.artifacts_dir, GFX_HOST)
+        for target, variants in self.LAYOUTS.items():
+            for variant in variants:
+                _stage_package_artifacts(
+                    PKG_RAND, cfg.artifacts_dir, f"{target}{variant}"
+                )
+        return cfg
+
+    def test_device_payload_found_for_each_layout(self) -> None:
+        cfg = self._stage_layouts()
+        for target, variants in self.LAYOUTS.items():
+            with self.subTest(target=target, variants=variants):
+                roots = filter_components_fromartifactory(
+                    PKG_RAND, cfg.artifacts_dir, target, enable_kpack=True
+                )
+                source_dirs = [
+                    root.relative_to(cfg.artifacts_dir).parts[0] for root in roots
+                ]
+                lib_dirs = list(
+                    dict.fromkeys(d for d in source_dirs if d.startswith("rand_lib_"))
+                )
+                self.assertEqual(
+                    lib_dirs, [f"rand_lib_{target}{v}" for v in sorted(variants)]
+                )
+                # Meta packages must depend on exactly the device packages with content.
+                self.assertEqual(
+                    has_artifact_for_arch(PKG_RAND, cfg.artifacts_dir, target),
+                    bool(roots),
+                )
+
+    def test_meta_depends_on_every_target_with_device_payload(self) -> None:
+        cfg = self._stage_layouts()
+        self.assertEqual(
+            expand_kpack_meta_dependencies(PKG_RAND, cfg.gfxarch_list, cfg),
+            [
+                "amdrocm-rand-host-asan7.1",
+                "amdrocm-rand-asan7.1-gfx1100",
+                "amdrocm-rand-asan7.1-gfx942",
+                "amdrocm-rand-asan7.1-gfx950",
+                "amdrocm-rand-asan7.1-gfx90a",
+            ],
+        )
+
+    def test_asan_meta_packages_depend_on_device_packages(self) -> None:
+        """Auto-detected ASAN tree whose device payloads exist only as ``:xnack+``."""
+        for pkg_type in (TEST_PKG_TYPE_DEB, TEST_PKG_TYPE_RPM):
+            for pkg_name in (PKG_RAND, PKG_SOLVER, PKG_HIPTENSOR, PKG_ROCALUTION):
+                with self.subTest(pkg_type=pkg_type, pkg_name=pkg_name):
+                    root = self.temp_dir / pkg_type / pkg_name
+                    for target in (GFX_HOST, "gfx942:xnack+", "gfx950:xnack+"):
+                        _stage_package_artifacts(pkg_name, root / "artifacts", target)
+                    cfg = _kpack_config(
+                        root, target=None, pkg_type=pkg_type, build_variant="asan"
+                    )
+                    self.assertEqual(cfg.gfxarch_list, ("gfx942", "gfx950"))
+                    self.assertEqual(
+                        _generated_dependency_names(
+                            pkg_name, replace(cfg, gfx_arch=GFX_META)
+                        ),
+                        [
+                            f"{pkg_name}-host-asan7.1",
+                            f"{pkg_name}-asan7.1-gfx942",
+                            f"{pkg_name}-asan7.1-gfx950",
+                        ],
+                    )
+
+    def test_device_package_depends_on_same_target_variant_only_package(self) -> None:
+        """``amdrocm-blas`` gfx942 pulls ``amdrocm-solver`` gfx942 (``:xnack+`` only)."""
+        for pkg_type in (TEST_PKG_TYPE_DEB, TEST_PKG_TYPE_RPM):
+            with self.subTest(pkg_type=pkg_type):
+                cfg = _kpack_config(
+                    self.temp_dir / pkg_type,
+                    target=["gfx942"],
+                    pkg_type=pkg_type,
+                    build_variant="asan",
+                )
+                for target in (GFX_HOST, "gfx942", "gfx942:xnack+"):
+                    _stage_package_artifacts(PKG_BLAS, cfg.artifacts_dir, target)
+                for target in (GFX_HOST, "gfx942:xnack+"):
+                    _stage_package_artifacts(PKG_SOLVER, cfg.artifacts_dir, target)
+                self.assertEqual(
+                    _generated_dependency_names(
+                        PKG_BLAS, replace(cfg, gfx_arch="gfx942")
+                    ),
+                    ["amdrocm-blas-host-asan7.1", "amdrocm-solver-asan7.1-gfx942"],
+                )
+
+    def test_arch_metapackage_depends_on_variant_only_packages(self) -> None:
+        """``amdrocm-hpc`` gfx942 keeps rocALUTION and hipTensor (``:xnack+`` only)."""
+        for pkg_type in (TEST_PKG_TYPE_DEB, TEST_PKG_TYPE_RPM):
+            with self.subTest(pkg_type=pkg_type):
+                cfg = _kpack_config(
+                    self.temp_dir / pkg_type,
+                    target=["gfx942"],
+                    pkg_type=pkg_type,
+                    build_variant="asan",
+                )
+                for pkg_name in (PKG_ROCALUTION, PKG_HIPTENSOR):
+                    for target in (GFX_HOST, "gfx942:xnack+"):
+                        _stage_package_artifacts(pkg_name, cfg.artifacts_dir, target)
+                self.assertEqual(
+                    _generated_dependency_names(
+                        PKG_HPC, replace(cfg, gfx_arch="gfx942")
+                    ),
+                    [
+                        "amdrocm-rocalution-asan7.1-gfx942",
+                        "amdrocm-hiptensor-asan7.1-gfx942",
+                    ],
+                )
+
+    def test_look_alike_directories_are_not_variants(self) -> None:
+        """Only ``{name}_{component}_{target}:<features>`` directories are variants."""
+        artifacts = self.artifacts_dir()
+        # gfx1250-strict is a separate target that shares the gfx1250 owner.
+        _stage_package_artifacts(PKG_RAND, artifacts, "gfx1250-strict")
+        # rand_dev_* belongs to amdrocm-rand-devel, not amdrocm-rand.
+        _stage_package_artifacts("amdrocm-rand-devel", artifacts, "gfx942:xnack+")
+        # Reuse a real MIOpen manifest root so only the directory name can reject
+        # the miopenprovider directory for the miopen artifact.
+        _stage_artifact_dir(artifacts, "miopenprovider_lib_gfx942:xnack+", "MIOpen/lib")
+        for pkg_name, target, expected in (
+            (PKG_RAND, "gfx1250-strict", True),
+            (PKG_RAND, "gfx1250", False),
+            (PKG_RAND, "gfx942", False),
+            (PKG_DNN, "gfx942", False),
+        ):
+            with self.subTest(pkg_name=pkg_name, target=target):
+                self.assertEqual(
+                    has_artifact_for_arch(pkg_name, artifacts, target), expected
+                )
+                roots = filter_components_fromartifactory(
+                    pkg_name, artifacts, target, enable_kpack=True
+                )
+                self.assertEqual(bool(roots), expected)
 
 
 class PackageFailureExitTest(BuildPackageTestCase):
