@@ -19,83 +19,83 @@
     reports that the hipBLASLt path works on a current nightly.
   - Merged
     [ROCm/rocm-libraries#2681](https://github.com/ROCm/rocm-libraries/pull/2681)
-    fixes the hipBLASLt/TensileLite side of this bug family. It is titled
-    “gfx12 Fix ttmp init workaround,” changes gfx12 launches from
-    multidimensional to flattened 1D, and records a closely related
-    `m=3, n=2073600, k=3` reproducer. It was not backported to the ROCm 7.2
-    source line used by the Windows wheel.
+    is the identified fp32 fix. It changes gfx12 launches from
+    multidimensional to flattened 1D and its initial commit adds the exact
+    `{m=3,n=524289,k=3}` regression shape. Closed
+    [rocm-libraries#5706](https://github.com/ROCm/rocm-libraries/issues/5706)
+    independently reproduced the silent gfx1201 corruption with
+    `hipblaslt-bench` on ROCm 7.2 and confirmed `507afd7d` fixes it.
   - Open
     [ROCm/rocm-libraries#9184](https://github.com/ROCm/rocm-libraries/pull/9184)
-    is the clear candidate for the regular rocBLAS/Tensile side. It chunks the
-    large free dimension around `rocblas_call_tensile`; its newer selected
-    tiles yield `2^21`/`2^22` test boundaries, while an 8-wide tile would
-    yield this issue's `2^19` boundary. The PR remains unmerged, conflicting,
-    and unvalidated on the exact Windows configuration.
+    fixes a separate legacy rocBLAS/Tensile grid-Y defect. Its verified
+    boundaries are `2^21` for fp64 and `2^22` for fp32, so it is only an
+    alternative for issue #8554 if the affected call rejects internal
+    hipBLASLt and falls back. It remains unmerged and conflicting.
   - No open TheRock PR matching issue #8554 was found. An unrelated PR matched
     only because it mentioned the number `524288`.
 
 ## Root cause
 
-- The most likely cause is an upstream **16-bit grid-Y/workgroup launch limit**
-  reached by the large free dimension. ROCm 7.2 has backend-specific forms of
-  the same defect in hipBLASLt/TensileLite and legacy rocBLAS/Tensile; neither
-  is TheRock build glue:
+- The demonstrated fp32 failure is effectively identified as the old
+  **hipBLASLt/TensileLite gfx12 multidimensional-grid defect** fixed by
+  [PR #2681](https://github.com/ROCm/rocm-libraries/pull/2681), not TheRock
+  build glue:
   - PyTorch converts row-major `[N,3] @ [3,3]` into column-major
     `m=3, n=N, k=3`. The row/column swap is documented in
     [`pytorch/pytorch@v2.9.1: aten/src/ATen/native/cuda/Blas.cpp#L108-L192`](https://github.com/pytorch/pytorch/blob/v2.9.1/aten/src/ATen/native/cuda/Blas.cpp#L108-L192).
-  - gfx1201 grid Y/Z is 16-bit. The observed transition has the exact
-    geometry `524288 = 65536 * 8`: an 8-wide free-dimension tile fits through
-    `N=524288`, while `N=524289` needs one more Y workgroup. The matching
-    hipBLASLt
-    [`fp32` catalog](https://github.com/ROCm/rocm-libraries/blob/171b86988decb713c842236cee4898dfce2e3bf5/projects/hipblaslt/library/src/amd_detail/rocblaslt/src/Tensile/Logic/asm_full/gfx1201/GridBased/gfx1201_Cijk_Ailk_Bljk_SB_Bias_HAS_SAV_UserArgs.yaml#L150-L160)
-    contains `MacroTile1: 8`. The exact legacy-Tensile fp64 tile could not be
-    established statically; its identical transition implies an 8-wide tile
-    if this grid-Y mechanism is the cause. Hardware logging must prove both
-    selected solutions.
-- The reported preference experiment does not force two cleanly isolated
-  backends:
+  - The ROCm 7.2 gfx1201 selector maps the oversized-grid edge to
+    [solution 0](https://github.com/ROCm/rocm-libraries/blob/171b86988decb713c842236cee4898dfce2e3bf5/projects/hipblaslt/library/src/amd_detail/rocblaslt/src/Tensile/Logic/asm_full/gfx1201/GridBased/gfx1201_Cijk_Ailk_Bljk_SB_Bias_HAS_SAV_UserArgs.yaml#L1238-L1239),
+    an
+    [`MT8x8` kernel](https://github.com/ROCm/rocm-libraries/blob/171b86988decb713c842236cee4898dfce2e3bf5/projects/hipblaslt/library/src/amd_detail/rocblaslt/src/Tensile/Logic/asm_full/gfx1201/GridBased/gfx1201_Cijk_Ailk_Bljk_SB_Bias_HAS_SAV_UserArgs.yaml#L114-L197).
+    Since gfx12 grid Y/Z is 16-bit,
+    `524288 = 65536 * 8` is the last representable launch; `N=524289` needs
+    workgroup ID 65536.
+  - The affected wheel pins rocm-libraries `171b8698`. It computes separate
+    logical X/Y counts but skips flattening Y/Z on gfx12 in
+    [`ContractionSolution.cpp#L1271-L1347`](https://github.com/ROCm/rocm-libraries/blob/171b86988decb713c842236cee4898dfce2e3bf5/projects/hipblaslt/tensilelite/src/ContractionSolution.cpp#L1271-L1347).
+    TensileLite uses
+    [`hipExtModuleLaunchKernel`](https://github.com/ROCm/rocm-libraries/blob/171b86988decb713c842236cee4898dfce2e3bf5/projects/hipblaslt/tensilelite/src/hip/HipSolutionAdapter.cpp#L373-L403),
+    and the affected CLR revision omitted the Y/Z bounds check present on the
+    ordinary module launch
+    ([`hip_module.cpp#L534-L604`](https://github.com/ROCm/rocm-systems/blob/a7cfb4d18e54d55307ca6f11804049e84f517094/projects/clr/hipamd/src/hip_module.cpp#L534-L604)).
+    That explains why output can be silently omitted instead of returning an
+    API error.
+  - Commit
+    [`507afd7d`](https://github.com/ROCm/rocm-libraries/commit/507afd7d815aad804e923629b28147318047407a)
+    flattens logical Y/Z into physical X and restores logical IDs in the
+    kernel prologue. Its initial commit added the exact
+    [`{3,524289,3}` test](https://github.com/ROCm/rocm-libraries/blob/69ca701c824e780ff737b7a22c4593ccdc367eac/projects/hipblaslt/clients/tests/data/matmul_common.yaml#L51-L60).
+    ROCm 7.2 deliberately lacks the complete fix, as release PR
+    [#5292](https://github.com/ROCm/rocm-libraries/pull/5292) documents; the
+    current TheRock pin contains it.
+- The reported preference experiment does not isolate backends, and the exact
+  fp64 mechanism remains unresolved:
   - In PyTorch 2.9.1,
     [`TORCH_BLAS_PREFER_HIPBLASLT=0` leaves the backend at `Default`](https://github.com/pytorch/pytorch/blob/v2.9.1/aten/src/ATen/Context.h#L478-L482);
     `Default` automatically selects hipBLASLt on gfx1201 in
     [`Context.cpp#L464-L524`](https://github.com/pytorch/pytorch/blob/v2.9.1/aten/src/ATen/Context.cpp#L464-L524).
-  - fp32 normally uses direct hipBLASLt. The matching ROCm 7.2.1 Windows wheel
-    branch
-    [`ROCm/TheRock@ba21f57`](https://github.com/ROCm/TheRock/commit/ba21f57e0275d8c2b64cf4b52966db996b918090)
-    pins rocm-libraries `171b8698`, whose gfx12 host path leaves the launch
-    multidimensional in
-    [`ContractionSolution.cpp#L1271-L1346`](https://github.com/ROCm/rocm-libraries/blob/171b86988decb713c842236cee4898dfce2e3bf5/projects/hipblaslt/tensilelite/src/ContractionSolution.cpp#L1271-L1346)
-    and reconstructs workgroup IDs later in
-    [`StreamK.py#L1704-L1718`](https://github.com/ROCm/rocm-libraries/blob/171b86988decb713c842236cee4898dfce2e3bf5/projects/hipblaslt/tensilelite/Tensile/Components/StreamK.py#L1704-L1718).
-    Merged
-    [`507afd7d` / PR #2681](https://github.com/ROCm/rocm-libraries/commit/507afd7d815aad804e923629b28147318047407a)
-    flattens the launch into grid X and restores logical IDs at kernel entry.
-    The ROCm 7.2 wheel pin lacks that fix; the current TheRock pin contains it.
-  - fp64 does **not** have a supported direct hipBLASLt GEMM in this release,
-    as both
+  - PyTorch bypasses its own direct Lt helper for fp64 in
     [`CUDABlas.cpp#L1261-L1278`](https://github.com/pytorch/pytorch/blob/v2.9.1/aten/src/ATen/cuda/CUDABlas.cpp#L1261-L1278)
-    and the
-    [ROCm 7.2.1 hipBLASLt support table](https://github.com/ROCm/rocm-libraries/blob/171b86988decb713c842236cee4898dfce2e3bf5/projects/hipblaslt/docs/reference/api-reference.rst#L79-L92)
-    show. It goes through hipBLAS/rocBLAS and is expected to fall back to
-    legacy Tensile. In the wheel source,
-    [`gemm_templates.cpp#L76-L140`](https://github.com/ROCm/rocm-libraries/blob/171b86988decb713c842236cee4898dfce2e3bf5/projects/rocblas/library/src/blas3/Tensile/gemm_templates.cpp#L76-L140)
-    passes full `N` to `rocblas_call_tensile`; only the source fallback chunks
-    `N`, and that fallback is skipped when Tensile reports success. Open
-    [PR #9184](https://github.com/ROCm/rocm-libraries/pull/9184) adds the
-    missing chunk loop.
-- Thus the common explanation for fp32 and fp64 is launch geometry, not one
-  shared kernel implementation: both can cross the same 16-bit Y limit if
-  their selected solutions use an 8-wide free-dimension tile. PR #2681 is the
-  likely hipBLASLt-side fix; PR #9184 is the still-unmerged rocBLAS/Tensile
-  fix.
-- Evidence: the exact `65536 * 8` transition; the fp32 release catalog; the
-  old unflattened and unchunked launch sources; issue #8645's Linux hardware
-  results; #2681's near-identical `m=3, k=3` case; and #9184's
-  fail-before/pass-after gfx1201 evidence. This remains source-based
-  localization, not a reproduction of issue #8554.
+    but then calls hipBLAS/rocBLAS. This TheRock build enables rocBLAS's
+    internal hipBLASLt delegation, whose routing has no double exclusion and
+    maps double to `HIP_R_64F`/`HIPBLAS_COMPUTE_64F`
+    ([`hipblaslt_host.cpp#L44-L90`](https://github.com/ROCm/rocm-libraries/blob/171b86988decb713c842236cee4898dfce2e3bf5/projects/rocblas/library/src/hipblaslt_host.cpp#L44-L90)).
+    Therefore fp64 can still reach the affected TensileLite path indirectly.
+  - However, the double GridBased edge predicts an MT16 solution, whose
+    16-bit-Y boundary is `2^20`, not `2^19`. The exact fp64 claim in issue
+    #8554 has no posted solution log or per-size output. Plausible explanations
+    are a different runtime-selected MT8 solution, a related effective
+    `2^15` remapping defect referenced by #2681, or fallback to the separate
+    legacy-Tensile bug in open PR #9184. Hardware logging is required to
+    distinguish them.
+- Evidence for fp32: exact boundary arithmetic, exact release selector and
+  tile, exact regression shape in the fix, issue #5706's direct
+  fail-before/pass-after confirmation, and release #5292's explicit statement
+  that #2681 is absent. Confidence for fp64 is materially lower.
 - Ownership: **upstream**, in `ROCm/rocm-libraries`, principally
-  `projects/hipblaslt/tensilelite/src/ContractionSolution.cpp` for the Lt path
-  and `projects/rocblas/library/src/blas3/Tensile/gemm_templates.cpp` for the
-  regular path.
+  `projects/hipblaslt/tensilelite/src/ContractionSolution.cpp`; classic
+  `projects/rocblas/library/src/blas3/Tensile/gemm_templates.cpp` remains an
+  alternative only if logs show fallback.
 
 ## Fix
 
@@ -105,7 +105,7 @@
     fp32/fp64 boundary scan, CPU comparison, mismatch location, and chunked-GPU
     control.
   - `reports/8554/library-repro.md` maps the PyTorch operation to BLAS
-    arguments and provides a direct fp32 hipBLASLt command plus fp32/fp64
+    arguments and provides direct fp32/fp64 hipBLASLt probes plus fp32/fp64
     rocBLAS commands for both sides of the boundary.
   - `reports/report-8554.md` records the source localization, related upstream
     work, limitations, and an unfiled upstream draft.
@@ -123,27 +123,27 @@
 
 - Why this approach rather than alternatives:
 
-  - No TheRock product code is wrong. Its current rocm-libraries pin contains
-    the hipBLASLt fix but not unmerged rocBLAS PR #9184.
-  - Advancing the submodule cannot pick up an unmerged fix, while carrying
-    #9184 as a patch without gfx1201 hardware would be an unvalidated
-    correctness and performance risk.
+  - No TheRock product code is wrong, and its current rocm-libraries pin
+    already contains primary fix `507afd7d`.
+  - Backporting component code through TheRock or carrying unmerged PR #9184
+    without gfx1201 hardware would be an unvalidated correctness and
+    performance risk.
   - A reproducer and version-specific backport report are the appropriate
     deliverables without matching hardware.
 
 - Mitigation:
 
   - Keep each leading-dimension chunk at or below 262144 rows.
-  - Test a current-nightly Windows stack. It contains hipBLASLt fix
-    `507afd7d`, but the fp64/legacy-Tensile result must still be checked because
-    PR #9184 remains unmerged.
+  - Test a current-nightly Windows stack containing `507afd7d`. Existing
+    Linux gfx1201 evidence confirms its fp32 fix; fp64 still needs explicit
+    boundary and solution logging.
   - Use `ROCBLAS_USE_HIPBLASLT=0` plus `ROCBLAS_LAYER=10` to isolate and
-    confirm the legacy Tensile path.
+    determine whether the separate legacy-Tensile defect participates.
 
 - Drafted upstream issue text (not filed):
 
   ````markdown
-  Title: [gfx1201][ROCm 7.2 Windows] GEMM grid-Y overflow at N=2^19; correlate hipBLASLt #2681 and rocBLAS #9184
+  Title: [hipBLASLt][gfx1201][ROCm 7.2 Windows] Backport #2681 for N=524289 GEMM corruption; clarify fp64
 
   Repository: ROCm/rocm-libraries
 
@@ -151,19 +151,20 @@
   `[N,3] @ [3,3]` is correct at N=524288 and silently wrong at N=524289 for
   both fp32 and fp64. Chunking to 262144 rows is correct. PyTorch maps this to
   column-major `m=3, n=N, k=3`; `524288 = 65536 * 8`, exactly the gfx1201
-  grid-Y capacity for a MacroTileN=8 solution. The ROCm 7.2 gfx1201 fp32
-  hipBLASLt catalog contains that tile; the fp64 Tensile tile needs to be
-  confirmed from runtime logging.
+  grid-Y capacity of the fp32 selector's MT8 solution.
 
-  The affected wheel branch pins rocm-libraries 171b8698. Its fp32
-  hipBLASLt/TensileLite path keeps a multidimensional gfx12 launch; merged
-  PR #2681 / commit 507afd7d later flattened that launch. fp64 is not a
-  supported direct hipBLASLt combination in this release and routes through
-  rocBLAS/Tensile, where
-  `projects/rocblas/library/src/blas3/Tensile/gemm_templates.cpp` passes the
-  full free dimension to `rocblas_call_tensile`. Open PR #9184 adds the
-  missing chunking there. Related issue #8645 reports both old-stack failures
-  on Linux and says current-nightly hipBLASLt is correct.
+  The affected wheel pins rocm-libraries 171b8698. Its
+  `projects/hipblaslt/tensilelite/src/ContractionSolution.cpp` keeps a
+  multidimensional gfx12 launch. Merged PR #2681 / commit 507afd7d flattened
+  that launch and added the exact `{3,524289,3}` regression. Issue #5706
+  independently confirms the old-stack failure and this fix on Linux
+  gfx1201. Release PR #5292 confirms the complete fix is absent from ROCm 7.2.
+
+  PyTorch bypasses its direct Lt helper for fp64, but this package's rocBLAS
+  can delegate double GEMM back to hipBLASLt. The default double selector
+  predicts MT16, so the asserted fp64 transition at 2^19 is not yet explained;
+  please capture its actual backend and solution. If it falls back to classic
+  Tensile, open PR #9184 is the adjacent candidate.
 
   Reproducer:
 
@@ -180,10 +181,9 @@
           print(dtype, n, (got - ref).abs().max().item())
   ```
 
-  Please capture both the hipBLASLt solution and rocBLAS internal backend on
-  gfx1201, validate #2681 and #9184 independently, and add an exact
-  524288/524289 fp32+fp64 regression case. Backport the applicable fixes to
-  the maintained ROCm 7.2 Windows line, or document the first fixed wheel.
+  Please backport #2681 to the maintained ROCm 7.2 Windows line (or document
+  the first fixed wheel), add an exact 524288/524289 fp32 regression, and
+  capture the fp64 backend/solution before assigning its fix.
   ````
 
 ## Branch
@@ -196,7 +196,9 @@
     reproducers for issue 8554
   - `749310385d4b98696bac69850f73512cbc46844d` Finalize issue 8554
     validation report
-  - The branch-tip report correction incorporates final source-trace results.
+  - `77e31c395979d570de4f5a7aa01295111c39eda2` Correct backend-specific
+    root cause for issue 8554
+  - The branch-tip report correction incorporates the final hipBLASLt trace.
     Its own SHA cannot be embedded in its contents; it is reported in the
     handoff.
 
@@ -224,13 +226,13 @@ made, and reproducing the upstream GPU defect requires unavailable hardware.
   VM is Linux-only and has no AMD GPU. A maintainer should run the torch
   reproducer with `HIPBLASLT_LOG_MASK=32` and replay the logged command with
   `hipblaslt-bench --print_kernel_info`.
-- The direct fp32 `hipblaslt-bench` and fp32/fp64 `rocblas-bench` commands are
-  unexecuted because neither ROCm clients nor a GPU are present. Run both
-  boundary sizes and both rocBLAS backend settings from
-  `reports/8554/library-repro.md` on the affected wheel payload.
-- Neither commit `507afd7d` nor PR #9184 could be proven to fix this exact
-  shape. Validate the affected ROCm 7.2.1 build, a current nightly, and a
-  #9184 build on the same gfx1201 Windows host with identical inputs.
+- The direct fp32/fp64 `hipblaslt-bench` probes and fp32/fp64
+  `rocblas-bench` commands are unexecuted because neither ROCm clients nor a
+  GPU are present. Run both boundary sizes and both rocBLAS backend settings
+  from `reports/8554/library-repro.md` on the affected wheel payload.
+- Commit `507afd7d` includes the exact fp32 shape, but its pass result and the
+  reported fp64 behavior could not be validated here. Compare the affected
+  ROCm 7.2.1 build with a current nightly on the same Windows host.
 - The pure legacy rocBLAS/Tensile path could not be separated. Set
   `ROCBLAS_USE_HIPBLASLT=0`, confirm the internal backend with
   `ROCBLAS_LAYER=10`, and test both this `2^19` boundary and PR #9184's
@@ -243,26 +245,26 @@ made, and reproducing the upstream GPU defect requires unavailable hardware.
 ## Confidence
 
 - **Low: 65%**
-- Justification: the exact `65536 * 8` threshold, dtype routing, fp32 release
-  catalog, unchunked source, and related hardware report form a coherent
-  mechanism. Confidence remains low because the selected solutions and
-  before/after behavior were not observed on gfx1201, Windows, or any GPU in
-  this environment, and the two dtypes likely traverse different backend
-  implementations.
+- Justification: fp32 has exact threshold arithmetic, selector evidence, an
+  exact regression in the fix, and independent gfx1201 confirmation.
+  Confidence remains low overall because no GPU work ran here and the asserted
+  fp64 `2^19` transition conflicts with the default double selector's MT16
+  geometry.
 
 ## Risks / follow-ups
 
 - Capture the hipBLASLt solution index plus the rocBLAS internal backend,
   kernel name, macro-tile, launch dimensions, and first mismatching row at
   `N=524288` and `N=524289`.
-- Test `507afd7d` and PR #9184 independently on the reporter's Windows host;
-  do not treat source ancestry or another shape's boundary as proof.
+- Test `507afd7d` on the reporter's Windows host for both dtypes. Test PR #9184
+  only if `ROCBLAS_LAYER=10` shows fallback to classic Tensile.
 - Confirm the backend with logs. `TORCH_BLAS_PREFER_HIPBLASLT=0` is not a
   force-off switch in PyTorch 2.9.1 on gfx1201.
-- Coordinate with [rocm-libraries#8645](https://github.com/ROCm/rocm-libraries/issues/8645)
-  rather than opening a duplicate unless maintainers prefer a release-specific
-  backport issue.
+- Coordinate with [rocm-libraries#5706](https://github.com/ROCm/rocm-libraries/issues/5706)
+  and [#8645](https://github.com/ROCm/rocm-libraries/issues/8645) rather than
+  opening a duplicate unless maintainers prefer a release-specific backport
+  issue.
 - Continue review of
   [rocm-libraries#9184](https://github.com/ROCm/rocm-libraries/pull/9184);
-  fp64 naturally reaches the regular BLAS path in PyTorch 2.9.1, and the
-  PR's broad chunking change may affect performance.
+  its broad chunking change may affect performance, and its verified
+  thresholds differ from issue #8554.
