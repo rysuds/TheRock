@@ -129,9 +129,7 @@ def compare_tensors(
 
     first_mismatch = None
     if mismatch_count:
-        flat_index = int(
-            mismatch_mask.reshape(-1).nonzero(as_tuple=False)[0].item()
-        )
+        flat_index = int(mismatch_mask.reshape(-1).nonzero(as_tuple=False)[0].item())
         row, column = divmod(flat_index, int(reference.shape[1]))
         first_mismatch = (
             row,
@@ -222,9 +220,7 @@ def main(argv: list[str]) -> int:
     apply_environment_override(
         "TORCH_BLAS_PREFER_HIPBLASLT", args.torch_blas_prefer_hipblaslt
     )
-    apply_environment_override(
-        "ROCBLAS_USE_HIPBLASLT", args.rocblas_use_hipblaslt
-    )
+    apply_environment_override("ROCBLAS_USE_HIPBLASLT", args.rocblas_use_hipblaslt)
     if args.disable_addmm_lt:
         os.environ["DISABLE_ADDMM_CUDA_LT"] = "1"
 

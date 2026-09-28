@@ -92,6 +92,7 @@
 ## Fix
 
 - What changed and why:
+
   - `reports/8554/repro_torch_matmul.py` adds a deterministic torch-level
     fp32/fp64 boundary scan, CPU comparison, mismatch location, and chunked-GPU
     control.
@@ -100,6 +101,7 @@
     sides of the boundary and both backend modes.
   - `reports/report-8554.md` records the source localization, related upstream
     work, limitations, and an unfiled upstream draft.
+
 - Key diffs summarized:
 
   ```python
@@ -112,13 +114,16 @@
   ```
 
 - Why this approach rather than alternatives:
+
   - No TheRock product code is wrong at the current base, and its current
     rocm-libraries pin already contains the likely upstream fix.
   - Changing a submodule pin or carrying a patch would be an unvalidated
     regression risk and would duplicate merged upstream work.
   - A reproducer and version-specific backport report are the appropriate
     deliverables without matching hardware.
+
 - Mitigation:
+
   - Keep each leading-dimension chunk at or below 262144 rows.
   - Test a TheRock 7.11-or-newer/current-nightly Windows stack, whose
     rocm-libraries pin contains `507afd7d`. This is a source-derived
@@ -126,6 +131,7 @@
   - To isolate the separate legacy Tensile path, set
     `ROCBLAS_USE_HIPBLASLT=0` on a call known to reach rocBLAS and compare with
     open PR #9184.
+
 - Drafted upstream issue text (not filed):
 
   ````markdown
@@ -177,19 +183,25 @@
 - Base: `main` @ `20abb1e96819fe8a85935db7e329dd8a69396303`
 - Branch name: `cursor/investigate-8554-gfx1201-564d` (pushed only to
   `rysuds/TheRock`)
-- Commits: N/A in this pre-validation report revision; the final report will
-  record the resulting commit SHAs.
+- Commits:
+  - `b4d932893875f27d9639888e0e080b4822381a4c` Add investigation and
+    reproducers for issue 8554
+  - The branch-tip report-only commit records formatting and validation. Its
+    own SHA cannot be embedded in its contents; it is reported in the handoff.
 
 ## Validation performed in the cloud agent environment
 
 Environment: Linux x86_64, no AMD GPU, Python 3.12.3, CMake 3.28.3.
 
-| # | Command (exact) | Result | Notes |
-|---|---|---|---|
-| 1 | `python3 -m py_compile reports/8554/repro_torch_matmul.py` | Pending | Run after the required pre-validation commit |
-| 2 | `python3 reports/8554/repro_torch_matmul.py --help` | Pending | Exercises CLI parsing without importing torch |
-| 3 | `pre-commit run --files reports/8554/repro_torch_matmul.py reports/8554/library-repro.md reports/report-8554.md` | Pending | `pre-commit` must be installed first |
-| 4 | `git diff --check HEAD^ HEAD` | Pending | Whitespace validation |
+| #   | Command (exact)                                                                                                               | Result                     | Notes                                                            |
+| --- | ----------------------------------------------------------------------------------------------------------------------------- | -------------------------- | ---------------------------------------------------------------- |
+| 1   | `python3 -m py_compile reports/8554/repro_torch_matmul.py`                                                                    | Passed                     | No output                                                        |
+| 2   | `python3 reports/8554/repro_torch_matmul.py --help`                                                                           | Passed                     | Printed argparse help without importing torch                    |
+| 3   | `~/.local/bin/pre-commit run --files reports/8554/repro_torch_matmul.py reports/8554/library-repro.md reports/report-8554.md` | Reformatted files, exit 1  | First run: Black changed the script and mdformat changed reports |
+| 4   | `~/.local/bin/pre-commit run --files reports/8554/repro_torch_matmul.py reports/8554/library-repro.md reports/report-8554.md` | Reformatted report, exit 1 | Second run followed a validation-table edit                      |
+| 5   | `~/.local/bin/pre-commit run --files reports/8554/repro_torch_matmul.py reports/8554/library-repro.md reports/report-8554.md` | Passed                     | All applicable hooks passed with pre-commit 4.6.2                |
+| 6   | `git diff --check HEAD^ HEAD`                                                                                                 | Passed                     | No output; checked the pre-validation commit                     |
+| 7   | `git diff --check`                                                                                                            | Passed                     | No output                                                        |
 
 Pre-fix fail / post-fix pass is N/A in this repository: no product fix was
 made, and reproducing the upstream GPU defect requires unavailable hardware.
