@@ -66,15 +66,18 @@ If this reports no supported solution, the rocBLAS trace determines whether
 the Torch path instead fell back to classic Tensile.
 
 ROCm/rocm-libraries
-[PR #2681](https://github.com/ROCm/rocm-libraries/pull/2681) also recorded a
-closely related failing command:
+[PR #2753](https://github.com/ROCm/rocm-libraries/pull/2753) was motivated by
+this closely related failing command and replaced the small gfx12 fp32/fp64
+catalog tiles with MT64-class solutions:
 
 ```text
 hipblaslt-bench -transA T -transB N -m 3 -n 2073600 -k 3 --a_type f32
 ```
 
-Use the option spellings printed by the installed `hipblaslt-bench --help` if
-the ROCm 7.2.1 client rejects an option above.
+Paired [PR #2681](https://github.com/ROCm/rocm-libraries/pull/2681) fixes the
+gfx12 multidimensional launch itself. Use the option spellings printed by the
+installed `hipblaslt-bench --help` if the ROCm 7.2.1 client rejects an option
+above.
 
 ## Through rocBLAS
 
