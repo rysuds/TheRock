@@ -151,6 +151,7 @@ import os
 from pathlib import Path
 from packaging.version import parse
 import platform
+import re
 import shutil
 import shlex
 import subprocess
@@ -1084,6 +1085,108 @@ def copy_libuv_to_torch_lib(pytorch_dir: Path):
     shutil.copy2(uv_dll, target_lib)
 
 
+# aotriton commits whose headers fail to compile in PyTorch with clang-cl:
+# util.h's non-inline `cdiv` template is AOTRITON_API, which ROCm/aotriton#244
+# made dllimport outside of aotriton itself.
+# TODO(https://github.com/ROCm/TheRock/issues/8564): Remove once PyTorch pins
+# an aotriton commit with the fix.
+WINDOWS_BROKEN_AOTRITON_COMMITS = frozenset(
+    {
+        "eb7b78ba31331c8063afcd01420d958c7a0571ce",  # 0.14.1b
+        "c11b5b886a10a00f925f74133d38b3505e67ccd9",  # 0.14.2b
+    }
+)
+
+
+def get_pytorch_aotriton_commit(pytorch_dir: Path, env: dict[str, str]) -> str | None:
+    """Returns the aotriton commit PyTorch will build from source, if known.
+
+    Mirrors pytorch/cmake/External/aotriton.cmake, where
+    AOTRITON_INSTALLED_PREFIX skips the source build and
+    PYTORCH_AOTRITON_COMMIT overrides the pinned __AOTRITON_CI_COMMIT.
+    """
+    if "AOTRITON_INSTALLED_PREFIX" in env:
+        return None
+    if "PYTORCH_AOTRITON_COMMIT" in env:
+        return env["PYTORCH_AOTRITON_COMMIT"]
+    aotriton_cmake = pytorch_dir / "cmake" / "External" / "aotriton.cmake"
+    if not aotriton_cmake.exists():
+        return None
+    pinned_commits = re.findall(
+        r'set\(\s*__AOTRITON_CI_COMMIT\s+"([0-9a-fA-F]{40})"\s*\)',
+        aotriton_cmake.read_text(encoding="utf-8"),
+    )
+    return pinned_commits[0] if len(pinned_commits) == 1 else None
+
+
+def resolve_use_flash_attention(
+    enable_pytorch_flash_attention: bool | None,
+    *,
+    is_windows: bool,
+    triton_requirement: str | None,
+    pytorch_rocm_arch: str,
+    aotriton_commit: str | None,
+) -> bool:
+    """Decides whether to build torch with flash attention (aotriton)."""
+    if enable_pytorch_flash_attention is not None:
+        use_flash_attention = enable_pytorch_flash_attention
+        print(f"Flash Attention explicitly set to: {use_flash_attention}")
+        # Note: this may fail if aotriton is not supported, see below.
+    elif not is_windows and not triton_requirement:
+        print(f"Disabling Flash Attention on Linux since triton is not built")
+        use_flash_attention = False
+    else:
+        # Enable aotriton by default if supported.
+        # aotriton supports a subset of GPU architectures. When *at least* one
+        # target arch is supported let aotriton's build system (gpu_targets.py)
+        # filter to just the supported ones. The runtime (check_gpu in
+        # sdp_utils.cpp) gracefully falls back to math/CK backends on
+        # unsupported GPUs. We only disable flash attention when *no* target
+        # arch is supported — otherwise aotriton's configure step fails on the
+        # empty target list (https://github.com/ROCm/aotriton/issues/169).
+        #
+        # These prefixes match what aotriton's gpu_targets.py recognizes.
+        # See also the image list in pytorch/cmake/External/aotriton.cmake.
+        AOTRITON_SUPPORTED_ARCH_PREFIXES = (
+            "gfx90a",
+            "gfx942",
+            "gfx950",
+            "gfx11",
+            "gfx12",
+        )
+        rocm_arch_list = pytorch_rocm_arch.split(";")
+        has_aotriton_supported_arch = any(
+            arch.startswith(AOTRITON_SUPPORTED_ARCH_PREFIXES) for arch in rocm_arch_list
+        )
+        use_flash_attention = has_aotriton_supported_arch
+        print(
+            f"Flash Attention default behavior: {use_flash_attention}\n"
+            f"  (has_aotriton_supported_arch: {has_aotriton_supported_arch})"
+        )
+
+    if (
+        use_flash_attention
+        and is_windows
+        and aotriton_commit is not None
+        and aotriton_commit.lower() in WINDOWS_BROKEN_AOTRITON_COMMITS
+    ):
+        issue = "https://github.com/ROCm/TheRock/issues/8564"
+        if enable_pytorch_flash_attention is not None:
+            print(
+                f"::warning::aotriton {aotriton_commit} does not compile on "
+                f"Windows ({issue}); expect this build to fail"
+            )
+        else:
+            print(
+                f"::warning::Disabling Flash Attention: aotriton "
+                f"{aotriton_commit} does not compile on Windows ({issue}). "
+                "Set PYTORCH_AOTRITON_COMMIT to a fixed aotriton commit or pass "
+                "--enable-pytorch-flash-attention to override"
+            )
+            use_flash_attention = False
+    return use_flash_attention
+
+
 def do_build_pytorch(
     args: argparse.Namespace,
     pytorch_dir: Path,
@@ -1119,41 +1222,17 @@ def do_build_pytorch(
     (pytorch_dir / "torch" / "_rocm_init.py").write_text(get_rocm_init_contents(args))
 
     # Enable/disable flash attention.
-    if args.enable_pytorch_flash_attention is not None:
-        use_flash_attention = args.enable_pytorch_flash_attention
-        print(f"Flash Attention explicitly set to: {use_flash_attention}")
-        # Note: this may fail if aotriton is not supported, see below.
-    elif not is_windows and not triton_requirement:
-        print(f"Disabling Flash Attention on Linux since triton is not built")
-        use_flash_attention = False
-    else:
-        # Enable aotriton by default if supported.
-        # aotriton supports a subset of GPU architectures. When *at least* one
-        # target arch is supported let aotriton's build system (gpu_targets.py)
-        # filter to just the supported ones. The runtime (check_gpu in
-        # sdp_utils.cpp) gracefully falls back to math/CK backends on
-        # unsupported GPUs. We only disable flash attention when *no* target
-        # arch is supported — otherwise aotriton's configure step fails on the
-        # empty target list (https://github.com/ROCm/aotriton/issues/169).
-        #
-        # These prefixes match what aotriton's gpu_targets.py recognizes.
-        # See also the image list in pytorch/cmake/External/aotriton.cmake.
-        AOTRITON_SUPPORTED_ARCH_PREFIXES = (
-            "gfx90a",
-            "gfx942",
-            "gfx950",
-            "gfx11",
-            "gfx12",
-        )
-        rocm_arch_list = env.get("PYTORCH_ROCM_ARCH", "").split(";")
-        has_aotriton_supported_arch = any(
-            arch.startswith(AOTRITON_SUPPORTED_ARCH_PREFIXES) for arch in rocm_arch_list
-        )
-        use_flash_attention = has_aotriton_supported_arch
-        print(
-            f"Flash Attention default behavior: {use_flash_attention}\n"
-            f"  (has_aotriton_supported_arch: {has_aotriton_supported_arch})"
-        )
+    use_flash_attention = resolve_use_flash_attention(
+        args.enable_pytorch_flash_attention,
+        is_windows=is_windows,
+        triton_requirement=triton_requirement,
+        pytorch_rocm_arch=env.get("PYTORCH_ROCM_ARCH", ""),
+        aotriton_commit=(
+            get_pytorch_aotriton_commit(pytorch_dir, {**os.environ, **env})
+            if is_windows
+            else None
+        ),
+    )
     # Finally update the environment with the resolved setting.
     env.update(
         {
