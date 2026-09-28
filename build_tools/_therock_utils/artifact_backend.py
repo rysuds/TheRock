@@ -18,11 +18,16 @@ Environment-based switching:
 from abc import ABC, abstractmethod
 from dataclasses import dataclass
 from pathlib import Path
-from typing import List, Optional, Set
+from typing import Callable, List, Optional, Set, TypeVar
 import os
 import shutil
+import sys
+import threading
 
 from .workflow_outputs import WorkflowOutputRoot
+
+
+_ReadResultT = TypeVar("_ReadResultT")
 
 
 @dataclass
@@ -35,6 +40,27 @@ class ArtifactLocation:
 
 # Supported artifact archive extensions (in order of preference)
 ARTIFACT_EXTENSIONS = (".tar.zst", ".tar.xz")
+
+# S3 error responses that specifically mean request authentication failed.
+# AccessDenied is deliberately excluded: valid credentials can lack permission,
+# and retrying those errors anonymously would hide an authorization problem.
+_S3_AUTHENTICATION_ERROR_CODES = frozenset(
+    {
+        "ExpiredToken",
+        "InvalidAccessKeyId",
+        "InvalidSecurity",
+        "InvalidToken",
+        "SignatureDoesNotMatch",
+        "TokenRefreshRequired",
+    }
+)
+
+# HeadObject has no response body, so S3 can only return a generic 403 even
+# when the actual failure is an invalid access key. boto3's download_file()
+# performs this request before downloading an object.
+_HEAD_OBJECT_FORBIDDEN_ERROR_CODES = frozenset(
+    {"403", "AccessDenied", "Forbidden"}
+)
 
 
 def _is_artifact_archive(filename: str) -> bool:
@@ -206,6 +232,10 @@ class S3Backend(ArtifactBackend):
     def __init__(self, output_root: WorkflowOutputRoot):
         self.output_root = output_root
         self._s3_client = None
+        self._s3_client_is_unsigned = False
+        self._unsigned_s3_client = None
+        self._prefer_unsigned_reads = False
+        self._unsigned_read_lock = threading.Lock()
 
     @property
     def bucket(self) -> str:
@@ -229,15 +259,16 @@ class S3Backend(ArtifactBackend):
         3. Shared credentials file (``AWS_SHARED_CREDENTIALS_FILE``)
 
         When no credentials are found at all, the client falls back to
-        unsigned requests for public bucket reads.
+        unsigned requests for public bucket reads. Credentials that resolve
+        but are rejected by S3 are handled by ``_read``.
         """
         if self._s3_client is None:
             import boto3
-            from botocore import UNSIGNED
             from botocore.config import Config
 
             session = boto3.Session()
             credentials = session.get_credentials()
+            self._s3_client_is_unsigned = credentials is None
 
             if credentials is not None:
                 self._s3_client = session.client(
@@ -246,12 +277,96 @@ class S3Backend(ArtifactBackend):
                     config=Config(max_pool_connections=100),
                 )
             else:
-                self._s3_client = session.client(
-                    "s3",
-                    verify=True,
-                    config=Config(max_pool_connections=100, signature_version=UNSIGNED),
-                )
+                self._s3_client = self.unsigned_s3_client
         return self._s3_client
+
+    @property
+    def unsigned_s3_client(self):
+        """Lazy-initialized S3 client that never signs requests."""
+        if self._unsigned_s3_client is None:
+            import boto3
+            from botocore import UNSIGNED
+            from botocore.config import Config
+
+            self._unsigned_s3_client = boto3.Session().client(
+                "s3",
+                verify=True,
+                config=Config(max_pool_connections=100, signature_version=UNSIGNED),
+            )
+        return self._unsigned_s3_client
+
+    @staticmethod
+    def _should_retry_read_unsigned(error) -> bool:
+        """Return whether an S3 read failure may be recovered anonymously."""
+        error_code = error.response.get("Error", {}).get("Code")
+        if error_code in _S3_AUTHENTICATION_ERROR_CODES:
+            return True
+
+        if error.operation_name != "HeadObject":
+            return False
+
+        http_status = error.response.get("ResponseMetadata", {}).get(
+            "HTTPStatusCode"
+        )
+        return (
+            http_status == 403
+            or error_code in _HEAD_OBJECT_FORBIDDEN_ERROR_CODES
+        )
+
+    def _read(
+        self, operation: Callable[[object], _ReadResultT]
+    ) -> _ReadResultT:
+        """Run an S3 read, retrying unsigned when signed authentication fails.
+
+        Artifact buckets are public for reads, but boto3 prefers any credentials
+        it resolves from a runner. A stale static key therefore prevents access
+        that would work anonymously. Once an unsigned retry succeeds, later
+        reads on this backend use the unsigned client directly.
+
+        Writes do not use this path and continue to require the primary client.
+        """
+        from botocore.exceptions import BotoCoreError, ClientError
+
+        if self._prefer_unsigned_reads:
+            return operation(self.unsigned_s3_client)
+
+        try:
+            return operation(self.s3_client)
+        except ClientError as signed_error:
+            if self._s3_client_is_unsigned or not self._should_retry_read_unsigned(
+                signed_error
+            ):
+                raise
+
+            # Concurrent downloads can all observe the first signed failure.
+            # Only the first successful fallback changes the read preference
+            # and emits a warning; waiting readers then use that decision.
+            with self._unsigned_read_lock:
+                if self._prefer_unsigned_reads:
+                    return operation(self.unsigned_s3_client)
+
+                try:
+                    result = operation(self.unsigned_s3_client)
+                except BotoCoreError as unsigned_error:
+                    raise signed_error from unsigned_error
+
+                self._prefer_unsigned_reads = True
+                self._warn_unsigned_retry(signed_error)
+                return result
+
+    def _warn_unsigned_retry(self, error) -> None:
+        """Report a successful fallback so rejected credentials stay visible."""
+        error_code = error.response.get("Error", {}).get("Code", "unknown error")
+        message = (
+            f"Signed S3 {error.operation_name} request for {self.base_uri} "
+            f"failed with {error_code}; anonymous retry succeeded. The runner's "
+            "AWS credentials may be stale or unauthorized for this read and "
+            "should be investigated."
+        )
+        if os.getenv("GITHUB_ACTIONS"):
+            print(f"::warning title=Signed S3 read rejected::{message}")
+        else:
+            print(f"WARNING: {message}", file=sys.stderr)
 
     @property
     def base_uri(self) -> str:
@@ -259,7 +374,11 @@ class S3Backend(ArtifactBackend):
 
     def list_artifacts(self, name_filter: Optional[str] = None) -> List[str]:
         """List S3 artifacts."""
-        paginator = self.s3_client.get_paginator("list_objects_v2")
+        return self._read(lambda client: self._list_artifacts(client, name_filter))
+
+    def _list_artifacts(self, client, name_filter: Optional[str]) -> List[str]:
+        """List S3 artifacts using the provided client."""
+        paginator = client.get_paginator("list_objects_v2")
         page_iterator = paginator.paginate(Bucket=self.bucket, Prefix=self.s3_prefix)
 
         artifacts = []
@@ -288,7 +407,11 @@ class S3Backend(ArtifactBackend):
         """Download from S3."""
         loc = self.output_root.artifact(artifact_key)
         dest_path.parent.mkdir(parents=True, exist_ok=True)
-        self.s3_client.download_file(self.bucket, loc.relative_path, str(dest_path))
+        self._read(
+            lambda client: client.download_file(
+                self.bucket, loc.relative_path, str(dest_path)
+            )
+        )
 
     def upload_artifact(self, source_path: Path, artifact_key: str) -> None:
         """Upload to S3."""
@@ -324,7 +447,11 @@ class S3Backend(ArtifactBackend):
         """Check if artifact exists in S3."""
         try:
             loc = self.output_root.artifact(artifact_key)
-            self.s3_client.head_object(Bucket=self.bucket, Key=loc.relative_path)
+            self._read(
+                lambda client: client.head_object(
+                    Bucket=self.bucket, Key=loc.relative_path
+                )
+            )
             return True
         except Exception:
             return False
