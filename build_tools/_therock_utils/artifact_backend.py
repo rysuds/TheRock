@@ -347,7 +347,7 @@ class S3Backend(ArtifactBackend):
 
                 try:
                     result = operation(self.unsigned_s3_client)
-                except BotoCoreError as unsigned_error:
+                except (BotoCoreError, ClientError) as unsigned_error:
                     raise signed_error from unsigned_error
 
                 self._prefer_unsigned_reads = True
