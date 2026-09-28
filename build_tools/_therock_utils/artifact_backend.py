@@ -58,9 +58,7 @@ _S3_AUTHENTICATION_ERROR_CODES = frozenset(
 # HeadObject has no response body, so S3 can only return a generic 403 even
 # when the actual failure is an invalid access key. boto3's download_file()
 # performs this request before downloading an object.
-_HEAD_OBJECT_FORBIDDEN_ERROR_CODES = frozenset(
-    {"403", "AccessDenied", "Forbidden"}
-)
+_HEAD_OBJECT_FORBIDDEN_ERROR_CODES = frozenset({"403", "AccessDenied", "Forbidden"})
 
 
 def _is_artifact_archive(filename: str) -> bool:
@@ -305,17 +303,10 @@ class S3Backend(ArtifactBackend):
         if error.operation_name != "HeadObject":
             return False
 
-        http_status = error.response.get("ResponseMetadata", {}).get(
-            "HTTPStatusCode"
-        )
-        return (
-            http_status == 403
-            or error_code in _HEAD_OBJECT_FORBIDDEN_ERROR_CODES
-        )
+        http_status = error.response.get("ResponseMetadata", {}).get("HTTPStatusCode")
+        return http_status == 403 or error_code in _HEAD_OBJECT_FORBIDDEN_ERROR_CODES
 
-    def _read(
-        self, operation: Callable[[object], _ReadResultT]
-    ) -> _ReadResultT:
+    def _read(self, operation: Callable[[object], _ReadResultT]) -> _ReadResultT:
         """Run an S3 read, retrying unsigned when signed authentication fails.
 
         Artifact buckets are public for reads, but boto3 prefers any credentials

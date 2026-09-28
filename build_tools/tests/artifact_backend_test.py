@@ -626,8 +626,7 @@ class TestS3BackendUnsignedReadFallback(unittest.TestCase):
                 "Contents": [
                     {
                         "Key": (
-                            "external/test-run-456-linux/"
-                            "partial_lib_generic.tar.zst"
+                            "external/test-run-456-linux/" "partial_lib_generic.tar.zst"
                         )
                     }
                 ]
@@ -689,9 +688,7 @@ class TestS3BackendUnsignedReadFallback(unittest.TestCase):
     def test_failed_unsigned_retry_preserves_signed_error_without_warning(self):
         """A failed fallback reports the original failure and no success warning."""
         signed_paginator = self._set_paginator_pages(self.signed_client, [])
-        signed_paginator.paginate.side_effect = self._client_error(
-            "InvalidAccessKeyId"
-        )
+        signed_paginator.paginate.side_effect = self._client_error("InvalidAccessKeyId")
         unsigned_paginator = self._set_paginator_pages(self.unsigned_client, [])
         unsigned_paginator.paginate.side_effect = self._client_error("AccessDenied")
 
@@ -712,9 +709,7 @@ class TestS3BackendUnsignedReadFallback(unittest.TestCase):
     def test_successful_fallback_switches_later_reads_to_unsigned(self):
         """Once proven public, later reads avoid repeatedly using the stale key."""
         signed_paginator = self._set_paginator_pages(self.signed_client, [])
-        signed_paginator.paginate.side_effect = self._client_error(
-            "InvalidAccessKeyId"
-        )
+        signed_paginator.paginate.side_effect = self._client_error("InvalidAccessKeyId")
         self._set_paginator_pages(self.unsigned_client, [self._empty_page()])
 
         stderr = io.StringIO()
@@ -736,9 +731,7 @@ class TestS3BackendUnsignedReadFallback(unittest.TestCase):
 
         def reject_signed_download(*args):
             signed_calls_ready.wait(timeout=5)
-            raise self._client_error(
-                "403", operation="HeadObject", http_status=403
-            )
+            raise self._client_error("403", operation="HeadObject", http_status=403)
 
         self.signed_client.download_file.side_effect = reject_signed_download
 
@@ -753,9 +746,7 @@ class TestS3BackendUnsignedReadFallback(unittest.TestCase):
                     max_workers=worker_count
                 ) as executor:
                     futures = [
-                        executor.submit(
-                            self.backend.download_artifact, path.name, path
-                        )
+                        executor.submit(self.backend.download_artifact, path.name, path)
                         for path in paths
                     ]
                     for future in futures:
@@ -767,9 +758,7 @@ class TestS3BackendUnsignedReadFallback(unittest.TestCase):
     def test_successful_read_fallback_does_not_change_upload_client(self):
         """Read fallback stays isolated from authenticated writes."""
         signed_paginator = self._set_paginator_pages(self.signed_client, [])
-        signed_paginator.paginate.side_effect = self._client_error(
-            "InvalidAccessKeyId"
-        )
+        signed_paginator.paginate.side_effect = self._client_error("InvalidAccessKeyId")
         self._set_paginator_pages(self.unsigned_client, [self._empty_page()])
 
         with tempfile.TemporaryDirectory() as temp_dir:
@@ -799,9 +788,7 @@ class TestS3BackendUnsignedReadFallback(unittest.TestCase):
     def test_successful_fallback_emits_github_actions_warning(self):
         """CI surfaces a recovered stale credential instead of silently hiding it."""
         signed_paginator = self._set_paginator_pages(self.signed_client, [])
-        signed_paginator.paginate.side_effect = self._client_error(
-            "InvalidAccessKeyId"
-        )
+        signed_paginator.paginate.side_effect = self._client_error("InvalidAccessKeyId")
         self._set_paginator_pages(self.unsigned_client, [self._empty_page()])
 
         stdout = io.StringIO()
@@ -809,9 +796,7 @@ class TestS3BackendUnsignedReadFallback(unittest.TestCase):
             with contextlib.redirect_stdout(stdout):
                 self.backend.list_artifacts()
 
-        self.assertIn(
-            "::warning title=Signed S3 read rejected::", stdout.getvalue()
-        )
+        self.assertIn("::warning title=Signed S3 read rejected::", stdout.getvalue())
         self.assertIn("InvalidAccessKeyId", stdout.getvalue())
 
 
