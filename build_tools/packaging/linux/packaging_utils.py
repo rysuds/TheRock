@@ -961,6 +961,19 @@ def validate_package_roots(roots: list[Path]) -> None:
                 )
 
 
+def _artifact_dirs_with_variants(artifacts_dir: Path, base_name: str) -> list[Path]:
+    """Return the ``base_name`` artifact directory plus its target-feature variants.
+
+    Kpack names per-target directories after the full target ID, so a component may
+    exist as ``blas_lib_gfx942``, ``blas_lib_gfx942:xnack+``, or both; components
+    without kernel databases only get the variant form. Variants must continue with
+    ``:`` (``gfx1250`` must not claim ``gfx1250-strict``) and are sorted so results
+    do not depend on directory listing order.
+    """
+    artifacts_dir = Path(artifacts_dir)
+    return [artifacts_dir / base_name, *sorted(artifacts_dir.glob(f"{base_name}:*"))]
+
+
 def filter_components_fromartifactory(
     pkg_name,
     artifacts_dir,
@@ -1061,10 +1074,9 @@ def filter_components_fromartifactory(
             component_list = subdir["Components"]
 
             for component in component_list:
-                # Find base artifact and all xnack variants (e.g., :xnack+, :xnack-)
-                base_pattern = f"{artifact_prefix}_{component}_{artifact_suffix}"
-                artifact_dirs = [Path(artifacts_dir) / base_pattern]
-                artifact_dirs.extend(Path(artifacts_dir).glob(f"{base_pattern}:*"))
+                artifact_dirs = _artifact_dirs_with_variants(
+                    artifacts_dir, f"{artifact_prefix}_{component}_{artifact_suffix}"
+                )
 
                 for source_dir in artifact_dirs:
                     filename = source_dir / "artifact_manifest.txt"
@@ -1164,6 +1176,10 @@ def resolve_versioned_dependency_list(dep_list, config: PackageConfig, is_meta):
 def has_artifact_for_arch(pkg_name, artifacts_dir, gfx_arch):
     """Check if a package has artifacts available for a specific architecture.
 
+    Looks at the same directories as ``filter_components_fromartifactory``,
+    including target-feature variants such as ``gfx942:xnack+``, so dependency
+    decisions match the device package contents.
+
     Parameters:
     pkg_name: Package name to check
     artifacts_dir: Directory where artifacts are stored
@@ -1206,30 +1222,26 @@ def has_artifact_for_arch(pkg_name, artifacts_dir, gfx_arch):
             artifact_subdir = subdir["Name"]
             component_list = subdir["Components"]
             for component in component_list:
-                source_dir = (
-                    Path(artifacts_dir)
-                    / f"{artifact_prefix}_{component}_{artifact_suffix}"
-                )
-                if not source_dir.exists():
-                    continue
+                for source_dir in _artifact_dirs_with_variants(
+                    artifacts_dir, f"{artifact_prefix}_{component}_{artifact_suffix}"
+                ):
+                    # Check if the required subdirectory exists in the manifest
+                    manifest_file = source_dir / "artifact_manifest.txt"
+                    if not manifest_file.exists():
+                        continue
 
-                # Check if the required subdirectory exists in the manifest
-                manifest_file = source_dir / "artifact_manifest.txt"
-                if not manifest_file.exists():
-                    continue
-
-                try:
-                    with manifest_file.open("r", encoding="utf-8") as file:
-                        for line in file:
-                            match_found = (
-                                isinstance(artifact_subdir, str)
-                                and (artifact_subdir.lower() + "/") in line.lower()
-                            )
-                            if match_found and line.strip():
-                                # Found at least one required subdirectory in the manifest
-                                return True
-                except OSError:
-                    continue
+                    try:
+                        with manifest_file.open("r", encoding="utf-8") as file:
+                            for line in file:
+                                match_found = (
+                                    isinstance(artifact_subdir, str)
+                                    and (artifact_subdir.lower() + "/") in line.lower()
+                                )
+                                if match_found and line.strip():
+                                    # Found at least one required subdirectory in the manifest
+                                    return True
+                    except OSError:
+                        continue
 
     return False
 
