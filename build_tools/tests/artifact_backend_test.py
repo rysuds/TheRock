@@ -4,12 +4,17 @@
 
 """Unit tests for artifact_backend.py."""
 
+import concurrent.futures
+import contextlib
+import io
 import os
 import socket
 import sys
 import tempfile
+import threading
 import unittest
 from botocore import UNSIGNED
+from botocore.exceptions import ClientError
 from pathlib import Path
 from unittest import mock
 
@@ -527,6 +532,287 @@ class TestS3Backend(unittest.TestCase):
 
         with self.assertRaises(TypeError):
             self.backend.copy_artifact("test.tar.zst", local_source)
+
+
+class TestS3BackendUnsignedReadFallback(unittest.TestCase):
+    """Tests for retrying public reads when signed credentials are rejected."""
+
+    _CREDENTIAL_ERROR_CODES = (
+        "ExpiredToken",
+        "InvalidAccessKeyId",
+        "InvalidSecurity",
+        "InvalidToken",
+        "SignatureDoesNotMatch",
+        "TokenRefreshRequired",
+    )
+
+    def setUp(self):
+        github_actions_env = mock.patch.dict(os.environ, {"GITHUB_ACTIONS": ""})
+        github_actions_env.start()
+        self.addCleanup(github_actions_env.stop)
+        self.backend, self.signed_client, self.unsigned_client = self._make_backend()
+
+    @staticmethod
+    def _make_backend():
+        backend = S3Backend(output_root=_make_s3_root())
+        signed_client = mock.MagicMock()
+        unsigned_client = mock.MagicMock()
+        # Prime both cached clients so tests never consult real credentials.
+        backend._s3_client = signed_client
+        backend._s3_client_is_unsigned = False
+        backend._unsigned_s3_client = unsigned_client
+        return backend, signed_client, unsigned_client
+
+    @staticmethod
+    def _client_error(code, operation="ListObjectsV2", http_status=None):
+        response = {"Error": {"Code": code, "Message": code}}
+        if http_status is not None:
+            response["ResponseMetadata"] = {"HTTPStatusCode": http_status}
+        return ClientError(response, operation)
+
+    @staticmethod
+    def _set_paginator_pages(client, pages):
+        paginator = mock.MagicMock()
+        client.get_paginator.return_value = paginator
+        paginator.paginate.return_value = iter(pages)
+        return paginator
+
+    @staticmethod
+    def _empty_page():
+        return {"Contents": []}
+
+    def test_list_retries_documented_s3_credential_errors_unsigned(self):
+        """Credential rejection codes retry a public listing without signing."""
+        for error_code in self._CREDENTIAL_ERROR_CODES:
+            with self.subTest(error_code=error_code):
+                backend, signed_client, unsigned_client = self._make_backend()
+                signed_paginator = self._set_paginator_pages(signed_client, [])
+                signed_paginator.paginate.side_effect = self._client_error(error_code)
+                self._set_paginator_pages(unsigned_client, [self._empty_page()])
+
+                stderr = io.StringIO()
+                with contextlib.redirect_stderr(stderr):
+                    artifacts = backend.list_artifacts()
+
+                self.assertEqual(artifacts, [])
+                self.assertIn(error_code, stderr.getvalue())
+
+    def test_list_does_not_retry_noncredential_errors(self):
+        """Permission, object, throttling, and service failures stay visible."""
+        for error_code in (
+            "AccessDenied",
+            "NoSuchBucket",
+            "SlowDown",
+            "InternalError",
+            "404",
+        ):
+            with self.subTest(error_code=error_code):
+                backend, signed_client, unsigned_client = self._make_backend()
+                signed_paginator = self._set_paginator_pages(signed_client, [])
+                signed_paginator.paginate.side_effect = self._client_error(error_code)
+
+                with self.assertRaises(ClientError) as raised:
+                    backend.list_artifacts()
+
+                self.assertEqual(raised.exception.response["Error"]["Code"], error_code)
+                unsigned_client.get_paginator.assert_not_called()
+
+    def test_partially_consumed_listing_restarts_unsigned(self):
+        """A failed signed paginator must not leak its partial results."""
+        signed_paginator = self._set_paginator_pages(self.signed_client, [])
+
+        def signed_pages():
+            yield {
+                "Contents": [
+                    {
+                        "Key": (
+                            "external/test-run-456-linux/"
+                            "partial_lib_generic.tar.zst"
+                        )
+                    }
+                ]
+            }
+            raise self._client_error("InvalidAccessKeyId")
+
+        signed_paginator.paginate.return_value = signed_pages()
+        self._set_paginator_pages(
+            self.unsigned_client,
+            [
+                {
+                    "Contents": [
+                        {
+                            "Key": (
+                                "external/test-run-456-linux/"
+                                "complete_lib_generic.tar.zst"
+                            )
+                        }
+                    ]
+                }
+            ],
+        )
+
+        with contextlib.redirect_stderr(io.StringIO()):
+            artifacts = self.backend.list_artifacts()
+
+        self.assertEqual(artifacts, ["complete_lib_generic.tar.zst"])
+
+    def test_download_retries_unsigned_on_head_object_forbidden(self):
+        """download_file's internal HeadObject 403 takes the public-read fallback."""
+        self.signed_client.download_file.side_effect = self._client_error(
+            "403", operation="HeadObject", http_status=403
+        )
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            dest_path = Path(temp_dir) / "artifact.tar.zst"
+            with contextlib.redirect_stderr(io.StringIO()):
+                self.backend.download_artifact("artifact.tar.zst", dest_path)
+
+        self.unsigned_client.download_file.assert_called_once_with(
+            "test-bucket",
+            "external/test-run-456-linux/artifact.tar.zst",
+            str(dest_path),
+        )
+
+    def test_artifact_exists_retries_unsigned_on_head_object_forbidden(self):
+        """A HeadObject 403 can be a stale key rather than a missing object."""
+        self.signed_client.head_object.side_effect = self._client_error(
+            "AccessDenied", operation="HeadObject", http_status=403
+        )
+        self.unsigned_client.head_object.return_value = {}
+
+        with contextlib.redirect_stderr(io.StringIO()):
+            exists = self.backend.artifact_exists("artifact.tar.zst")
+
+        self.assertTrue(exists)
+        self.unsigned_client.head_object.assert_called_once()
+
+    def test_failed_unsigned_retry_preserves_signed_error_without_warning(self):
+        """A failed fallback reports the original failure and no success warning."""
+        signed_paginator = self._set_paginator_pages(self.signed_client, [])
+        signed_paginator.paginate.side_effect = self._client_error(
+            "InvalidAccessKeyId"
+        )
+        unsigned_paginator = self._set_paginator_pages(self.unsigned_client, [])
+        unsigned_paginator.paginate.side_effect = self._client_error("AccessDenied")
+
+        stderr = io.StringIO()
+        with contextlib.redirect_stderr(stderr):
+            with self.assertRaises(ClientError) as raised:
+                self.backend.list_artifacts()
+
+        self.assertEqual(
+            raised.exception.response["Error"]["Code"], "InvalidAccessKeyId"
+        )
+        self.assertIsInstance(raised.exception.__cause__, ClientError)
+        self.assertEqual(
+            raised.exception.__cause__.response["Error"]["Code"], "AccessDenied"
+        )
+        self.assertEqual(stderr.getvalue(), "")
+
+    def test_successful_fallback_switches_later_reads_to_unsigned(self):
+        """Once proven public, later reads avoid repeatedly using the stale key."""
+        signed_paginator = self._set_paginator_pages(self.signed_client, [])
+        signed_paginator.paginate.side_effect = self._client_error(
+            "InvalidAccessKeyId"
+        )
+        self._set_paginator_pages(self.unsigned_client, [self._empty_page()])
+
+        stderr = io.StringIO()
+        with tempfile.TemporaryDirectory() as temp_dir:
+            with contextlib.redirect_stderr(stderr):
+                self.backend.list_artifacts()
+                self.backend.download_artifact(
+                    "artifact.tar.zst", Path(temp_dir) / "artifact.tar.zst"
+                )
+
+        self.signed_client.download_file.assert_not_called()
+        self.unsigned_client.download_file.assert_called_once()
+        self.assertEqual(stderr.getvalue().count("anonymous retry succeeded"), 1)
+
+    def test_concurrent_fallback_warns_once(self):
+        """Concurrent failures coordinate one fallback decision and warning."""
+        worker_count = 4
+        signed_calls_ready = threading.Barrier(worker_count)
+
+        def reject_signed_download(*args):
+            signed_calls_ready.wait(timeout=5)
+            raise self._client_error(
+                "403", operation="HeadObject", http_status=403
+            )
+
+        self.signed_client.download_file.side_effect = reject_signed_download
+
+        stderr = io.StringIO()
+        with tempfile.TemporaryDirectory() as temp_dir:
+            paths = [
+                Path(temp_dir) / f"artifact-{index}.tar.zst"
+                for index in range(worker_count)
+            ]
+            with contextlib.redirect_stderr(stderr):
+                with concurrent.futures.ThreadPoolExecutor(
+                    max_workers=worker_count
+                ) as executor:
+                    futures = [
+                        executor.submit(
+                            self.backend.download_artifact, path.name, path
+                        )
+                        for path in paths
+                    ]
+                    for future in futures:
+                        future.result()
+
+        self.assertEqual(self.unsigned_client.download_file.call_count, worker_count)
+        self.assertEqual(stderr.getvalue().count("anonymous retry succeeded"), 1)
+
+    def test_successful_read_fallback_does_not_change_upload_client(self):
+        """Read fallback stays isolated from authenticated writes."""
+        signed_paginator = self._set_paginator_pages(self.signed_client, [])
+        signed_paginator.paginate.side_effect = self._client_error(
+            "InvalidAccessKeyId"
+        )
+        self._set_paginator_pages(self.unsigned_client, [self._empty_page()])
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            source_path = Path(temp_dir) / "artifact.tar.zst"
+            source_path.touch()
+            with contextlib.redirect_stderr(io.StringIO()):
+                self.backend.list_artifacts()
+                self.backend.upload_artifact(source_path, source_path.name)
+
+        self.signed_client.upload_file.assert_called_once()
+        self.unsigned_client.upload_file.assert_not_called()
+
+    def test_already_unsigned_client_does_not_retry(self):
+        """An unsigned client failure has no second anonymous attempt."""
+        self.backend._s3_client = self.unsigned_client
+        self.backend._s3_client_is_unsigned = True
+        unsigned_paginator = self._set_paginator_pages(self.unsigned_client, [])
+        unsigned_paginator.paginate.side_effect = self._client_error(
+            "InvalidAccessKeyId"
+        )
+
+        with self.assertRaises(ClientError):
+            self.backend.list_artifacts()
+
+        self.assertEqual(self.unsigned_client.get_paginator.call_count, 1)
+
+    def test_successful_fallback_emits_github_actions_warning(self):
+        """CI surfaces a recovered stale credential instead of silently hiding it."""
+        signed_paginator = self._set_paginator_pages(self.signed_client, [])
+        signed_paginator.paginate.side_effect = self._client_error(
+            "InvalidAccessKeyId"
+        )
+        self._set_paginator_pages(self.unsigned_client, [self._empty_page()])
+
+        stdout = io.StringIO()
+        with mock.patch.dict(os.environ, {"GITHUB_ACTIONS": "true"}):
+            with contextlib.redirect_stdout(stdout):
+                self.backend.list_artifacts()
+
+        self.assertIn(
+            "::warning title=Signed S3 read rejected::", stdout.getvalue()
+        )
+        self.assertIn("InvalidAccessKeyId", stdout.getvalue())
 
 
 class TestS3BackendCredentials(unittest.TestCase):
